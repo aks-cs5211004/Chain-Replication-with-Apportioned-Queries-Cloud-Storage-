@@ -1,0 +1,765 @@
+import json
+from enum import Enum
+from typing import Optional, Final
+
+from core.logger import server_logger
+from core.message import JsonMessage, JsonMessage
+from core.network import ConnectionStub
+from core.server import Server, ServerInfo
+
+
+class RequestType(Enum):
+    SET = 1
+    GET = 2
+    COMMIT = 3
+
+
+class KVGetRequest:
+  def __init__(self, msg: JsonMessage):
+    self._json_message = msg
+    assert "key" in self._json_message, self._json_message
+
+  @property
+  def key(self) -> str:
+    return self._json_message["key"]
+
+  @property
+  def json_msg(self) -> JsonMessage:
+    return self._json_message
+
+
+class KVSetRequest:
+  def __init__(self, msg: JsonMessage):
+    self._json_message = msg
+    assert "key" in self._json_message, self._json_message
+    assert "val" in self._json_message, self._json_message
+
+  @property
+  def key(self) -> str:
+    return self._json_message["key"]
+
+  @property
+  def val(self) -> str:
+    return self._json_message["val"]
+
+  @property
+  def version(self) -> Optional[int]:
+    return self._json_message.get("ver")
+
+  @version.setter
+  def version(self, ver: int) -> None:
+    self._json_message['ver'] = ver
+
+  @property
+  def json_msg(self) -> JsonMessage:
+    return self._json_message
+
+  def __str__(self) -> str:
+    return str(self._json_message)
+
+
+class KVCommitRequest:
+    def __init__(self, msg: JsonMessage):
+        self._json_message = msg
+        assert "key" in self._json_message, self._json_message
+        assert "val" in self._json_message, self._json_message
+
+    @property
+    def key(self) -> str:
+        return self._json_message["key"]
+
+    @property
+    def val(self) -> str:
+        return self._json_message["val"]
+
+    @property
+    def version(self) -> int:
+        return self._json_message["ver"]
+
+    @property
+    def json_msg(self) -> JsonMessage:
+        return self._json_message
+    
+    def __str__(self) -> str:
+        return str(self._json_message)
+
+
+class CraqServer(Server):
+    """CRAQ server. Supports concurrent read while writes are in progress."""
+
+    def __init__(self, info: ServerInfo, connection_stub: ConnectionStub,
+                 next: Optional[ServerInfo], prev: Optional[ServerInfo],
+                 tail: ServerInfo) -> None:
+        super().__init__(info, connection_stub)
+        self.next: Final[Optional[str]] = None if next is None else next.name
+        self.prev: Final[Optional[str]] = None if prev is None else prev.name
+        self.tail: Final[str] = tail.name
+        self.temp_store: dict[str, dict[int, str]] = {}
+        self.store: dict[str, tuple[int, str]] = {} 
+
+    def _process_req(self, msg: JsonMessage) -> JsonMessage:
+        # print(msg)
+        if msg.get("type") == RequestType.GET.name:
+            return self._get(KVGetRequest(msg))
+        elif msg.get("type") == RequestType.SET.name:
+            return self._set(KVSetRequest(msg))
+        elif msg.get("type") == RequestType.COMMIT.name:
+            return self._commit(KVCommitRequest(msg))
+        else:
+            server_logger.critical("Invalid message type")
+            return JsonMessage({"status": "Unexpected type"})
+
+    def _get(self, req: KVGetRequest) -> JsonMessage:
+        _logger = server_logger.bind(server_name=self._info.name)
+        _logger.debug(f"GET request for key: {req.key}")
+
+        if req.key in self.temp_store and self.temp_store[req.key]:
+            tail_committed_version = self._query_tail_version(req.key)
+            temp_versions_dict = self.temp_store[req.key]
+            if tail_committed_version in temp_versions_dict:
+               return JsonMessage({"status": "OK", 
+                                   "val": temp_versions_dict[tail_committed_version], 
+                                   "ver": tail_committed_version})
+            elif req.key in self.store:
+                ver, val = self.store[req.key]
+                return JsonMessage({"status": "OK", "val": val, "ver": ver})
+        elif req.key in self.store:
+            ver, val= self.store[req.key]
+            return JsonMessage({"status": "OK", "val": val, "ver": ver})
+
+    def _set(self, req: KVSetRequest) -> JsonMessage:
+        _logger = server_logger.bind(server_name=self._info.name)
+        _logger.debug(f"SET request for key: {req.key} with value: {req.val}")
+        
+        if self.prev is None:
+            if req.key in self.temp_store and self.temp_store[req.key]:
+                current_version = max(self.temp_store[req.key].keys())
+            elif req.key in self.store:
+                current_version,_ = self.store[req.key]
+            else:
+                current_version = 0 
+            req.version = current_version + 1
+
+        if self.next is not None:
+            if req.key not in self.temp_store:
+                self.temp_store[req.key] = {}
+            self.temp_store[req.key][req.version] = req.val
+            return self._connection_stub.send(from_=self._info.name, to=self.next, message=req.json_msg)
+        else:
+            self.store[req.key] = (req.version, req.val)
+            commit_msg = KVCommitRequest(JsonMessage({"type":"COMMIT" ,"key": req.key, "val": req.val, "ver": req.version}))
+            self._propagate_commit_back(commit_msg)
+            return JsonMessage({"status": "OK"})
+
+    def _commit(self, req: KVCommitRequest) -> JsonMessage:
+        _logger = server_logger.bind(server_name=self._info.name)
+        _logger.debug(f"COMMIT request for key: {req.key} with version: {req.version}")
+        
+        self.store[req.key] = (req.version, req.val)
+        del self.temp_store[req.key][req.version]    
+        if self.prev is not None:
+            self._propagate_commit_back(req)
+        return JsonMessage({"status": "OK"})
+
+    def _propagate_commit_back(self, req: KVCommitRequest) -> None:
+        _logger = server_logger.bind(server_name=self._info.name)
+        
+        if self.prev is not None:
+            self._connection_stub.send(from_=self._info.name, to=self.prev, message=req.json_msg)
+        else:
+            _logger.warning("No previous server to propagate commit to.")
+
+
+    def _query_tail_version(self, key: str) -> Optional[int]:
+        _logger = server_logger.bind(server_name=self._info.name)
+        _logger.debug(f"Querying tail {self.tail} for committed version of key: {key}")
+        
+        query_msg = JsonMessage({"type": RequestType.GET.name, "key": key})
+        response = self._connection_stub.send(from_=self._info.name, to=self.tail, message=query_msg)
+        if response.get("status") == "OK":
+            return response.get("ver")
+        else:
+            return None
+
+        
+        
+        
+        
+        
+        
+        
+        
+        
+        
+        
+        
+        
+        
+        
+        
+        
+        
+        
+        
+        
+        
+        
+        
+        
+        
+        
+        
+        
+        
+        
+        
+        
+        
+        
+        
+        
+        
+        
+        
+        
+        
+        
+        
+        
+        
+        
+        
+        
+        
+        
+        
+        
+        
+        
+        
+        
+        
+        
+        
+        
+        
+        
+        
+        
+        
+        
+        
+        
+        
+        
+        
+        
+        
+        
+        
+        
+        
+        
+        
+        
+        
+        
+        
+        
+        
+        
+        
+        
+        
+        
+import json
+from enum import Enum
+from typing import Optional, Final
+
+from core.logger import server_logger
+from core.message import JsonMessage, JsonMessage
+from core.network import ConnectionStub
+from core.server import Server, ServerInfo
+
+
+class RequestType(Enum):
+    SET = 1
+    GET = 2
+    QUERY = 3
+
+
+class KVGetRequest:
+  def __init__(self, msg: JsonMessage):
+    self._json_message = msg
+    assert "key" in self._json_message, self._json_message
+
+  @property
+  def key(self) -> str:
+    return self._json_message["key"]
+
+  @property
+  def json_msg(self) -> JsonMessage:
+    return self._json_message
+
+
+class KVQueryRequest:
+  def __init__(self, msg: JsonMessage):
+    self._json_message = msg
+    assert "key" in self._json_message, self._json_message
+
+  @property
+  def key(self) -> str:
+    return self._json_message["key"]
+
+  @property
+  def json_msg(self) -> JsonMessage:
+    return self._json_message
+
+
+class KVSetRequest:
+  def __init__(self, msg: JsonMessage):
+    self._json_message = msg
+    assert "key" in self._json_message, self._json_message
+    assert "val" in self._json_message, self._json_message
+
+  @property
+  def key(self) -> str:
+    return self._json_message["key"]
+
+  @property
+  def val(self) -> str:
+    return self._json_message["val"]
+
+  @property
+  def version(self) -> Optional[int]:
+    return self._json_message.get("ver")
+
+  @version.setter
+  def version(self, ver: int) -> None:
+    self._json_message['ver'] = ver
+
+  @property
+  def json_msg(self) -> JsonMessage:
+    return self._json_message
+
+  def __str__(self) -> str:
+    return str(self._json_message)
+
+
+class CraqServer(Server):
+    """CRAQ server. Supports concurrent read while writes are in progress."""
+
+    def __init__(self, info: ServerInfo, connection_stub: ConnectionStub,
+                 next: Optional[ServerInfo], prev: Optional[ServerInfo],
+                 tail: ServerInfo) -> None:
+        super().__init__(info, connection_stub)
+        self.next: Final[Optional[str]] = None if next is None else next.name
+        self.prev: Final[Optional[str]] = None if prev is None else prev.name
+        self.tail: Final[str] = tail.name
+        self.temp_store: dict[str, dict[int, str]] = {}
+        self.store: dict[str, tuple[int, str]] = {} 
+
+    def _process_req(self, msg: JsonMessage) -> JsonMessage:
+        
+        if msg.get("type") == RequestType.GET.name:
+            return self._get(KVGetRequest(msg))
+        elif msg.get("type") == RequestType.SET.name:
+            return self._set(KVSetRequest(msg))
+        elif msg.get("type") == RequestType.QUERY.name:
+            return self._query(KVQueryRequest(msg))
+        else:
+            server_logger.critical("Invalid message type")
+            return JsonMessage({"status": "Unexpected type"})
+
+    def _get(self, req: KVGetRequest) -> JsonMessage:
+        _logger = server_logger.bind(server_name=self._info.name)
+        _logger.debug(f"GET request for key: {req.key}")
+        if req.key in self.temp_store and self.temp_store[req.key]:
+            query_msg = JsonMessage({"type": RequestType.QUERY.name, "key": req.key})
+            response = self._connection_stub.send(from_=self._info.name, to=self.next, message=query_msg)
+            tail_committed_version = response.get("ver")
+            temp_versions_dict = self.temp_store[req.key]
+            if tail_committed_version in temp_versions_dict:
+               return JsonMessage({"status": "OK", 
+                                   "val": temp_versions_dict[tail_committed_version]})
+            elif req.key in self.store:
+                _ , val = self.store[req.key]
+                return JsonMessage({"status": "OK", "val": val})
+        elif req.key in self.store:
+            _ , val= self.store[req.key]
+            return JsonMessage({"status": "OK", "val": val})
+    
+    def _query(self, req: KVQueryRequest) -> JsonMessage:
+        _logger = server_logger.bind(server_name=self._info.name)
+        _logger.debug(f"QUERY request for key: {req.key}")
+        
+        # ver, _ = self.store[req.key]
+        # return JsonMessage({"ver": ver})
+        
+        if self.next is None:
+          ver, _ = self.store[req.key]
+          return JsonMessage({"ver": ver})
+        else:
+          return self._connection_stub.send(from_=self._info.name, to=self.next, message=req.json_msg)
+        
+    def _set(self, req: KVSetRequest) -> JsonMessage:
+        _logger = server_logger.bind(server_name=self._info.name)
+        _logger.debug(f"SET request for key: {req.key} with value: {req.val}")
+        
+        if self.prev is None:
+            if req.key in self.temp_store and self.temp_store[req.key]:
+                current_version = max(self.temp_store[req.key].keys())
+            elif req.key in self.store:
+                current_version,_ = self.store[req.key]
+            else:
+                current_version = 0 
+            req.version = current_version + 1
+
+        if self.next is not None:
+            if req.key not in self.temp_store:
+                self.temp_store[req.key] = {}
+            self.temp_store[req.key][req.version] = req.val
+            # print("Dirty: ",self.temp_store, self.store)
+            self._connection_stub.send(from_=self._info.name, to=self.next, message=req.json_msg)
+            self.store[req.key] = (req.version, req.val)
+            del self.temp_store[req.key][req.version]
+            # print("Validated: ",self.temp_store, self.store)
+            return JsonMessage({"status": "OK"})       
+        else:
+            self.store[req.key] = (req.version, req.val)
+            return JsonMessage({"status": "OK"})     
+          
+          
+          
+          
+          
+          
+          
+          
+          
+          
+          
+          
+          
+          
+          
+          
+          
+          
+          
+          
+          
+          
+          
+          
+          
+          
+          
+          
+          
+          
+          
+          
+          
+          
+          
+          
+          
+          
+          
+          
+          
+          
+          
+          
+          
+          
+          
+          
+          
+          
+          
+          
+          
+          
+          
+          
+          
+          
+          
+          
+          
+          
+          
+          
+          
+          
+          
+          
+          
+          
+          
+          
+          
+          
+          
+          
+          
+          
+          
+          
+          
+          
+          
+          
+          
+          
+          
+          
+          
+          
+          
+          
+          
+          
+          
+          
+          
+          
+          
+          
+          
+          
+import json
+from enum import Enum
+from typing import Optional, Final
+
+from core.logger import server_logger
+from core.message import JsonMessage, JsonMessage
+from core.network import ConnectionStub
+from core.server import Server, ServerInfo
+import threading
+
+class ReadWriteLock:
+    def __init__(self):
+        self._read_ready = threading.Condition(threading.Lock())
+        self._readers = 0
+
+    def acquire_read(self):
+        with self._read_ready:
+            self._readers += 1
+
+    def release_read(self):
+        with self._read_ready:
+            self._readers -= 1
+            if self._readers == 0:
+                self._read_ready.notify_all()
+
+    def acquire_write(self):
+        self._read_ready.acquire()
+        while self._readers > 0:
+            self._read_ready.wait()
+
+    def release_write(self):
+        self._read_ready.release()
+        
+        
+
+class RequestType(Enum):
+    SET = 1
+    GET = 2
+    QUERY = 3
+
+
+class KVGetRequest:
+  def __init__(self, msg: JsonMessage):
+    self._json_message = msg
+    assert "key" in self._json_message, self._json_message
+
+  @property
+  def key(self) -> str:
+    return self._json_message["key"]
+
+  @property
+  def json_msg(self) -> JsonMessage:
+    return self._json_message
+
+
+class KVQueryRequest:
+  def __init__(self, msg: JsonMessage):
+    self._json_message = msg
+    assert "key" in self._json_message, self._json_message
+
+  @property
+  def key(self) -> str:
+    return self._json_message["key"]
+
+  @property
+  def json_msg(self) -> JsonMessage:
+    return self._json_message
+
+
+class KVSetRequest:
+  def __init__(self, msg: JsonMessage):
+    self._json_message = msg
+    assert "key" in self._json_message, self._json_message
+    assert "val" in self._json_message, self._json_message
+
+  @property
+  def key(self) -> str:
+    return self._json_message["key"]
+
+  @property
+  def val(self) -> str:
+    return self._json_message["val"]
+
+  @property
+  def version(self) -> Optional[int]:
+    return self._json_message.get("ver")
+
+  @version.setter
+  def version(self, ver: int) -> None:
+    self._json_message['ver'] = ver
+
+  @property
+  def json_msg(self) -> JsonMessage:
+    return self._json_message
+
+  def __str__(self) -> str:
+    return str(self._json_message)
+
+
+class CraqServer(Server):
+    """CRAQ server. Supports concurrent read while writes are in progress."""
+
+    def __init__(self, info: ServerInfo, connection_stub: ConnectionStub,
+                 next: Optional[ServerInfo], prev: Optional[ServerInfo],
+                 tail: ServerInfo) -> None:
+        super().__init__(info, connection_stub)
+        self.next: Final[Optional[str]] = None if next is None else next.name
+        self.prev: Final[Optional[str]] = None if prev is None else prev.name
+        self.tail: Final[str] = tail.name
+        self.temp_store: dict[str, dict[int, str]] = {}
+        self.store: dict[str, tuple[int, str]] = {} 
+      
+        self.store_lock = ReadWriteLock()
+        self.temp_store_lock = ReadWriteLock()
+
+    def _process_req(self, msg: JsonMessage) -> JsonMessage:
+        
+        if msg.get("type") == RequestType.GET.name:
+            return self._get(KVGetRequest(msg))
+        elif msg.get("type") == RequestType.SET.name:
+            return self._set(KVSetRequest(msg))
+        elif msg.get("type") == RequestType.QUERY.name:
+            return self._query(KVQueryRequest(msg))
+        else:
+            server_logger.critical("Invalid message type")
+            return JsonMessage({"status": "Unexpected type"})
+
+
+    def _get(self, req: KVGetRequest) -> JsonMessage:
+      _logger = server_logger.bind(server_name=self._info.name)
+      _logger.debug(f"GET request for key: {req.key}")
+
+      # Acquire the read lock manually
+      self.temp_store_lock.acquire_read()
+      try:
+          if req.key in self.temp_store and self.temp_store[req.key]:
+              query_msg = JsonMessage({"type": RequestType.QUERY.name, "key": req.key})
+              response = self._connection_stub.send(from_=self._info.name, to=self.next, message=query_msg)
+              tail_committed_version = response.get("ver")
+              temp_versions_dict = self.temp_store[req.key]
+              if tail_committed_version in temp_versions_dict:
+                  return JsonMessage({"status": "OK", "val": temp_versions_dict[tail_committed_version]})
+      finally:
+          # Always release the read lock
+          self.temp_store_lock.release_read()
+
+      # Acquire the store read lock manually
+      self.store_lock.acquire_read()
+      try:
+          if req.key in self.store:
+              _, val = self.store[req.key]
+              return JsonMessage({"status": "OK", "val": val})
+      finally:
+          # Always release the store lock
+          self.store_lock.release_read()
+
+      # Return a default response if key not found
+      return JsonMessage({"status": "NOT_FOUND", "val": None})
+  
+    def _query(self, req: KVQueryRequest) -> JsonMessage:
+      _logger = server_logger.bind(server_name=self._info.name)
+      _logger.debug(f"QUERY request for key: {req.key}")
+      
+      if self.next is None:
+          # Manually acquire and release the store read lock
+          self.store_lock.acquire_read()
+          try:
+              ver, _ = self.store[req.key]
+              return JsonMessage({"ver": ver})
+          finally:
+              self.store_lock.release_read()
+      else:
+          return self._connection_stub.send(from_=self._info.name, to=self.next, message=req.json_msg)
+    
+    def _set(self, req: KVSetRequest) -> JsonMessage:
+      _logger = server_logger.bind(server_name=self._info.name)
+      _logger.debug(f"SET request for key: {req.key} with value: {req.val}")
+      
+      # If this is the head node
+      if self.prev is None:
+          # Manually acquire and release the store read lock
+          self.store_lock.acquire_read()
+          try:
+              if req.key in self.temp_store and self.temp_store[req.key]:
+                  current_version = max(self.temp_store[req.key].keys())
+              elif req.key in self.store:
+                  current_version, _ = self.store[req.key]
+              else:
+                  current_version = 0
+              req.version = current_version + 1
+          finally:
+              self.store_lock.release_read()
+
+      # If this is not the tail node
+      if self.next is not None:
+          # Manually acquire and release the temp_store write lock
+          self.temp_store_lock.acquire_write()
+          try:
+              if req.key not in self.temp_store:
+                  self.temp_store[req.key] = {}
+              self.temp_store[req.key][req.version] = req.val
+          finally:
+              self.temp_store_lock.release_write()
+
+          # Forward the request to the next node in the chain
+          self._connection_stub.send(from_=self._info.name, to=self.next, message=req.json_msg)
+
+          # Manually acquire and release the store write lock
+          self.store_lock.acquire_write()
+          try:
+              self.store[req.key] = (req.version, req.val)
+          finally:
+              self.store_lock.release_write()
+
+          # Manually acquire and release the temp_store write lock to delete the version
+          self.temp_store_lock.acquire_write()
+          try:
+              del self.temp_store[req.key][req.version]
+          finally:
+              self.temp_store_lock.release_write()
+
+          return JsonMessage({"status": "OK"})
+      
+      # If this is the tail node
+      else:
+          # Manually acquire and release the store write lock
+          self.store_lock.acquire_write()
+          try:
+              self.store[req.key] = (req.version, req.val)
+          finally:
+              self.store_lock.release_write()
+
+          return JsonMessage({"status": "OK"})
